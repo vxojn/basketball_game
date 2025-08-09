@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+<title>모바일 1인칭 농구 (웹)</title>
+<style>
+  html, body { margin:0; height:100%; background:#000; overscroll-behavior:none; touch-action:none; }
+  #ui { position:fixed; inset:0; pointer-events:none; font-family:system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  .hud { position:absolute; top:8px; left:50%; transform:translateX(-50%); display:flex; gap:8px; pointer-events:auto; }
+  .pill { background:rgba(0,0,0,0.6); color:#fff; padding:6px 10px; border-radius:12px; font-size:14px; }
+  .btn { background:rgba(255,255,255,0.85); backdrop-filter:blur(6px); border:1px solid rgba(0,0,0,0.12); border-radius:16px;
+         padding:10px 14px; font-size:13px; box-shadow:0 2px 8px rgba(0,0,0,0.25); user-select:none; }
+  .btn:active { transform:translateY(1px); }
+  .btns-top { position:absolute; top:8px; right:8px; display:flex; gap:8px; pointer-events:auto; }
+  .btns-bottom { position:absolute; right:10px; bottom:14px; display:flex; gap:10px; align-items:end; pointer-events:auto; }
+  .shoot { width:84px; height:84px; display:flex; align-items:center; justify-content:center; font-size:18px; border-radius:22px; }
+  .joystick { position:absolute; left:10px; bottom:14px; width:112px; height:112px; border-radius:999px;
+              background:rgba(0,0,0,0.12); border:1px solid rgba(0,0,0,0.12); pointer-events:auto; }
+  .knob { position:absolute; width:56px; height:56px; border-radius:999px; background:rgba(255,255,255,0.85);
+          border:1px solid rgba(0,0,0,0.12); left:calc(50% - 28px); top:calc(50% - 28px); }
+  .crosshair { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); width:12px; height:12px; border:2px solid rgba(255,255,255,0.9); border-radius:999px; box-shadow:0 0 0 1px rgba(0,0,0,0.4) inset; }
+  .hint { position:absolute; bottom:8px; left:50%; transform:translateX(-50%); color:#fff; opacity:0.75; font-size:12px; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui">
+  <div class="hud">
+    <div class="pill" id="score">점수 0</div>
+    <div class="pill" id="power">파워 0%</div>
+  </div>
+  <div class="btns-top">
+    <div class="btn" id="env">배경 전환</div>
+    <div class="btn" id="pickup">집기</div>
+  </div>
+  <div class="btns-bottom">
+    <div class="btn shoot" id="shoot">슛</div>
+    <div class="btn" id="dribble">드리블 Off</div>
+  </div>
+  <div class="joystick" id="joy"><div class="knob" id="knob"></div></div>
+  <div class="crosshair"></div>
+  <div class="hint">좌측 조이스틱 이동 · 화면 드래그 시점 · 집기 → 드리블/슛</div>
+</div>
+<script type="module">
+import * as THREE from "https://unpkg.com/three@0.160.0/build/three.module.js";
+
+// ----- Renderer & Scene -----
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias:true, alpha:false });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+function resize(){ renderer.setSize(innerWidth, innerHeight, false); }
+addEventListener('resize', resize);
+resize();
+
+const scene = new THREE.Scene();
+let envMode = 'outdoor'; // indoor | night
+function setEnv(mode){
+  envMode = mode;
+  if(mode==='outdoor'){
+    scene.background = new THREE.Color(0x87baf5);
+    hemi.intensity = 0.6; sun.intensity = 0.9;
+  } else if(mode==='indoor'){
+    scene.background = new THREE.Color(0x222426);
+    hemi.intensity = 0.3; sun.intensity = 0.7;
+  } else {
+    scene.background = new THREE.Color(0x05070a);
+    hemi.intensity = 0.15; sun.intensity = 0.55;
+  }
+}
+
+// Lights
+const hemi = new THREE.HemisphereLight(0xffffff, 0x303040, 0.6);
+scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xffffff, 0.9);
+sun.position.set(5,8,5);
+sun.castShadow = true;
+sun.shadow.mapSize.set(1024,1024);
+scene.add(sun);
+setEnv('outdoor');
+
+// Camera
+const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.01, 200);
+camera.position.set(0, 1.6, 3);
+
+// Ground (court)
+const groundMat = new THREE.MeshStandardMaterial({ color: 0x5a5a5a });
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(100,100), groundMat);
+ground.rotation.x = -Math.PI/2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// Court ring line
+const ring = new THREE.Mesh(new THREE.RingGeometry(5.9, 6.0, 64), new THREE.MeshBasicMaterial({ color: 0xffffff, transparent:true, opacity:0.9, side:THREE.DoubleSide }));
+ring.rotation.x = -Math.PI/2;
+ring.position.y = 0.01;
+scene.add(ring);
+
+// Backboard & rim (simplified collisions)
+const hoop = new THREE.Group();
+scene.add(hoop);
+const backboard = new THREE.Mesh(new THREE.BoxGeometry(1.8, 1.0, 0.05), new THREE.MeshStandardMaterial({ color: 0xe8eef2 }));
+backboard.castShadow = true;
+backboard.position.set(0, 3.6, -5.7);
+hoop.add(backboard);
+
+const rim = new THREE.Mesh(new THREE.TorusGeometry(0.23, 0.02, 16, 32), new THREE.MeshStandardMaterial({ color: 0xff5a36 }));
+rim.rotation.x = Math.PI/2;
+rim.position.set(0, 3.05, -6.0);
+rim.castShadow = true;
+hoop.add(rim);
+
+// Scoring trigger (invisible box just under rim)
+const scoreBox = new THREE.Box3(new THREE.Vector3(-0.18, 2.8, -6.18), new THREE.Vector3(0.18, 2.98, -5.82));
+let scoredCooldown = 0;
+
+// Optional indoor wood floor
+function updateFloor(){ ground.material.color.set(envMode==='indoor' ? 0x9b6b3f : envMode==='night' ? 0x303030 : 0x5a5a5a); }
+updateFloor();
+
+// ----- Simple Physics for Ball -----
+const ballGeo = new THREE.SphereGeometry(0.12, 32, 32);
+const ballMat = new THREE.MeshStandardMaterial({ color: 0xd17700 });
+const ball = new THREE.Mesh(ballGeo, ballMat);
+ball.castShadow = true;
+scene.add(ball);
+
+let ballPos = new THREE.Vector3(0, 1.2, 0);
+let ballVel = new THREE.Vector3();
+const GRAV = new THREE.Vector3(0, -9.81, 0);
+const FLOOR_Y = 0;
+const RESTITUTION = 0.72; // bounce
+const FRICTION = 0.015;
+
+function resetBall(){ ballPos.set(0,1.2,0); ballVel.set(0,0,0); }
+resetBall();
+
+// Backboard plane (z = -5.7), with rectangle around backboard size, bounce
+function collideBackboard() {
+  if (ballPos.z > -5.7) return;
+  // Check if within backboard bounds (rough)
+  const bx = Math.abs(ballPos.x - backboard.position.x) <= 0.95;
+  const by = Math.abs(ballPos.y - backboard.position.y) <= 0.55;
+  if (bx && by && ballVel.z < 0) {
+    ballPos.z = -5.7 + 0.001;
+    ballVel.z *= -RESTITUTION;
+    ballVel.x *= (1-FRICTION*2);
+    ballVel.y *= (1-FRICTION*2);
+  }
+}
+
+// Very rough rim collision: clamp horizontal distance from rim center in XZ around Y≈3.05
+function collideRim(){
+  const center = new THREE.Vector3(0, 3.05, -6.0);
+  // Only process when near rim height
+  if (Math.abs(ballPos.y - center.y) > 0.35) return;
+  const to = new THREE.Vector2(ballPos.x - center.x, ballPos.z - center.z);
+  const r = 0.23 + 0.12; // rim radius + ball radius
+  const d = to.length();
+  if (d < r) {
+    const n = to.normalize();
+    const push = r - d + 0.0005;
+    // push out on XZ plane
+    ballPos.x += n.x * push;
+    ballPos.z += n.y * push;
+    // reflect velocity on XZ
+    const v2 = new THREE.Vector2(ballVel.x, ballVel.z);
+    const vn = n.clone().multiplyScalar(v2.dot(n));
+    const vt = v2.clone().sub(vn);
+    const vRef = vt.clone().sub(vn.multiplyScalar(RESTITUTION));
+    ballVel.x = vRef.x;
+    ballVel.z = vRef.y;
+    // damp a bit
+    ballVel.multiplyScalar(0.98);
+  }
+}
+
+// Floor collision
+function collideFloor(dt){
+  if (ballPos.y - 0.12 <= FLOOR_Y && ballVel.y < 0) {
+    ballPos.y = FLOOR_Y + 0.12 + 0.001;
+    ballVel.y *= -RESTITUTION;
+    ballVel.x *= (1 - FRICTION);
+    ballVel.z *= (1 - FRICTION);
+  }
+}
+
+// Scoring detection: ball center passes through scoreBox bounds with downward velocity
+function checkScore(dt){
+  if (scoredCooldown > 0) { scoredCooldown -= dt; return; }
+  if (ballVel.y < 0 &&
+      ballPos.x > scoreBox.min.x && ballPos.x < scoreBox.max.x &&
+      ballPos.y > scoreBox.min.y && ballPos.y < scoreBox.max.y &&
+      ballPos.z > scoreBox.min.z && ballPos.z < scoreBox.max.z) {
+    addScore(2);
+    scoredCooldown = 0.8;
+  }
+}
+
+// ----- First-person Controls -----
+let yaw = 0, pitch = 0;
+let draggingLook = false;
+let lastX=0, lastY=0;
+function onDown(e){ draggingLook = true; const t = e.touches? e.touches[0]: e; lastX=t.clientX; lastY=t.clientY; }
+function onMove(e){
+  if(!draggingLook) return;
+  const t = e.touches? e.touches[0]: e;
+  const dx = t.clientX - lastX, dy = t.clientY - lastY;
+  lastX=t.clientX; lastY=t.clientY;
+  const sens=0.12;
+  yaw -= dx*sens*0.01;
+  pitch = Math.max(-Math.PI/2+0.05, Math.min(Math.PI/2-0.05, pitch - dy*sens*0.01));
+}
+function onUp(){ draggingLook = false; }
+canvas.addEventListener('pointerdown', onDown);
+addEventListener('pointermove', onMove, { passive:true });
+addEventListener('pointerup', onUp, { passive:true });
+canvas.addEventListener('touchstart', onDown, { passive:true });
+addEventListener('touchmove', onMove, { passive:true });
+addEventListener('touchend', onUp, { passive:true });
+
+// Joystick
+const joy = document.getElementById('joy');
+const knob = document.getElementById('knob');
+let joyDrag=false, joyVec={x:0,y:0};
+const R=56; // radius px
+function joyDown(){ joyDrag=true; }
+function joyUp(){ joyDrag=false; joyVec={x:0,y:0}; knob.style.left='calc(50% - 28px)'; knob.style.top='calc(50% - 28px)'; }
+function joyMove(e){
+  if(!joyDrag) return;
+  const rect = joy.getBoundingClientRect();
+  const cx = rect.left + rect.width/2;
+  const cy = rect.top + rect.height/2;
+  const p = e.touches? e.touches[0] : e;
+  let x = p.clientX - cx, y = p.clientY - cy;
+  const len = Math.hypot(x,y);
+  if(len>R){ x = x/len*R; y = y/len*R; }
+  joyVec = { x:x/R, y:y/R };
+  knob.style.left = `calc(50% - 28px + ${x}px)`;
+  knob.style.top  = `calc(50% - 28px + ${y}px)`;
+}
+joy.addEventListener('pointerdown', joyDown);
+addEventListener('pointerup', joyUp);
+addEventListener('pointermove', joyMove, { passive:true });
+joy.addEventListener('touchstart', joyDown, { passive:true });
+addEventListener('touchend', joyUp, { passive:true });
+addEventListener('touchmove', joyMove, { passive:true });
+
+// Gameplay states
+let holding=false, dribbleOn=false, charge=0, score=0;
+const scoreEl = document.getElementById('score');
+const powerEl = document.getElementById('power');
+const btnPickup = document.getElementById('pickup');
+const btnDribble = document.getElementById('dribble');
+const btnShoot = document.getElementById('shoot');
+const btnEnv = document.getElementById('env');
+
+function addScore(p){ score += p; scoreEl.textContent = `점수 ${score}`; }
+
+btnEnv.addEventListener('click', () => {
+  setEnv(envMode==='outdoor' ? 'indoor' : envMode==='indoor' ? 'night' : 'outdoor');
+  updateFloor();
+});
+
+btnPickup.addEventListener('click', () => {
+  if(!holding){
+    // if ball within 2.0m
+    const d = camera.position.distanceTo(ballPos);
+    if(d < 2.0) holding=true;
+  } else holding=false;
+  btnPickup.textContent = holding? '드롭' : '집기';
+});
+
+btnDribble.addEventListener('click', () => {
+  dribbleOn = !dribbleOn;
+  btnDribble.textContent = `드리블 ${dribbleOn? 'On':'Off'}`;
+});
+
+let shootHold=false;
+btnShoot.addEventListener('pointerdown', () => { if(holding){ shootHold=true; } });
+btnShoot.addEventListener('pointerup', () => { releaseShoot(); });
+btnShoot.addEventListener('touchstart', () => { if(holding){ shootHold=true; } }, { passive:true });
+btnShoot.addEventListener('touchend', () => { releaseShoot(); }, { passive:true });
+
+function releaseShoot(){
+  if(!holding) { shootHold=false; return; }
+  holding=false;
+  btnPickup.textContent = '집기';
+  // direction = camera forward with slight arc
+  const f = new THREE.Vector3();
+  camera.getWorldDirection(f);
+  f.normalize(); f.y += 0.12; f.normalize();
+  const power = THREE.MathUtils.clamp(6 + charge*10, 6, 16);
+  ballVel.addScaledVector(f, power);
+  // add a little spin randomness
+  ballVel.x += (Math.random()-0.5)*0.2;
+  ballVel.z += (Math.random()-0.5)*0.2;
+  charge=0; shootHold=false;
+}
+
+// Movement helpers
+const forward = new THREE.Vector3();
+const right = new THREE.Vector3();
+const up = new THREE.Vector3(0,1,0);
+
+// Animation loop
+let lastT = performance.now()/1000;
+function tick(){
+  const now = performance.now()/1000;
+  const dt = Math.min(0.033, now - lastT);
+  lastT = now;
+
+  // Camera orientation
+  const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(pitch, yaw, 0, 'YXZ'));
+  camera.quaternion.copy(q);
+
+  // Move camera on XZ from joystick
+  camera.getWorldDirection(forward);
+  forward.y = 0; forward.normalize();
+  right.copy(forward).cross(up).negate();
+  const speed = 3.2;
+  camera.position.addScaledVector(forward, -joyVec.y * speed * dt);
+  camera.position.addScaledVector(right,    joyVec.x * speed * dt);
+  camera.position.y = 1.6;
+
+  // Holding logic / dribble
+  if(holding){
+    // Hand position slightly below/forward
+    const hand = new THREE.Vector3(0, -0.3, -0.6).applyQuaternion(camera.quaternion).add(camera.position);
+    ballPos.copy(hand);
+    if(dribbleOn){
+      // rhythmic downward nudge
+      const t = now*2.2;
+      if(Math.floor(t) !== Math.floor((now-dt)*2.2)){
+        ballVel.y -= 0.8;
+      }
+    }
+  } else {
+    // Physics integration
+    ballVel.addScaledVector(GRAV, dt);
+    ballPos.addScaledVector(ballVel, dt);
+
+    collideFloor(dt);
+    collideBackboard();
+    collideRim();
+    checkScore(dt);
+
+    // damping
+    ballVel.multiplyScalar(0.999);
+  }
+
+  // Shooting charge
+  if(shootHold){ charge = Math.min(1, charge + dt*0.8); }
+  else if(charge>0){ charge = Math.max(0, charge - dt*1.5); }
+  powerEl.textContent = `파워 ${Math.round(charge*100)}%`;
+
+  // Apply to mesh
+  ball.position.copy(ballPos);
+
+  renderer.render(scene, camera);
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+
+// Prevent context menu on long press
+addEventListener('contextmenu', e => e.preventDefault());
+
+</script>
+</body>
+</html>
